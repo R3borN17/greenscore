@@ -1,0 +1,158 @@
+import json
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+import boto3
+
+# S3 bucket and file configuration
+S3_BUCKET_NAME = "greenscore"
+COMBINED_FILE_NAME = "combined_data"
+
+# Mapping of Octopus Energy region codes to Carbon Intensity region IDs
+REGION_MAPPING = {
+    "A": 10,  # Eastern England -> East England
+    "B": 9,   # East Midlands -> East Midlands
+    "C": 13,  # London -> London
+    "D": 6,   # Merseyside and Northern Wales -> North Wales
+    "E": 8,   # West Midlands -> West Midlands
+    "F": 4,   # North Eastern England -> North East England
+    "G": 3,   # North Western England -> North West England
+    "H": 12,  # Southern England -> South England
+    "J": 14,  # South Eastern England -> South East England
+    "K": 7,   # Southern Wales -> South Wales
+    "L": 11,  # South Western England -> South West England
+    "M": 5,   # Yorkshire -> Yorkshire
+    "N": 2,   # Southern Scotland -> South Scotland
+}
+
+# Fetch tariff rates
+def fetch_tariff_rates(product_code, region_code, period_from, period_to):
+    tariff_code = f"E-1R-{product_code}-{region_code}"
+    tariff_url = f"https://api.octopus.energy/v1/products/{product_code}/electricity-tariffs/{tariff_code}/standard-unit-rates/"
+    params = {"period_from": period_from, "period_to": period_to}
+    try:
+        response = requests.get(tariff_url, params=params)
+        response.raise_for_status()
+        data = response.json().get("results", [])
+        for item in data:
+            item["region"] = region_code
+        return data
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching tariff rates for region {region_code}: {e}")
+        return []
+
+# Fetch 24-hour forecasted carbon intensity for all regions
+def fetch_carbon_intensity_24h(period_from):
+    carbon_intensity_url = f"https://api.carbonintensity.org.uk/regional/intensity/{period_from}/fw24h"
+    headers = {"Accept": "application/json"}
+    try:
+        response = requests.get(carbon_intensity_url, headers=headers)
+        response.raise_for_status()
+        data = response.json().get("data", [])
+        region_results = {}
+        for entry in data:
+            from_time = entry["from"]
+            to_time = entry["to"]
+            for region in entry.get("regions", []):
+                region_id = region["regionid"]
+                forecast = region["intensity"]["forecast"]
+                region_name = region["shortname"]
+                if region_id not in region_results:
+                    region_results[region_id] = []
+                region_results[region_id].append({
+                    "from": from_time,
+                    "to": to_time,
+                    "forecast": forecast,
+                    "region": region_name
+                })
+        return region_results
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching carbon intensity data: {e}")
+        return {}
+
+# Save data to S3
+def save_to_s3(bucket_name, file_name, data, timestamp=None):
+    s3 = boto3.client("s3")
+    if timestamp:
+        file_name = f"{file_name}_{timestamp}.json"
+    try:
+        s3.put_object(Bucket=bucket_name, Key=file_name, Body=json.dumps(data))
+        print(f"Successfully uploaded {file_name} to {bucket_name}")
+    except Exception as e:
+        print(f"Error saving data to S3: {e}")
+
+# Calculate green score and combine data
+def calculate_and_combine_data(tariff_rates, carbon_data_by_region):
+    combined_results = []
+
+    for region_code, region_id in REGION_MAPPING.items():
+        tariff_df = pd.DataFrame([rate for rate in tariff_rates if rate["region"] == region_code])
+        if tariff_df.empty or region_id not in carbon_data_by_region:
+            continue
+
+        tariff_df["valid_from"] = pd.to_datetime(tariff_df["valid_from"])
+        tariff_df["valid_to"] = pd.to_datetime(tariff_df["valid_to"])
+
+        carbon_df = pd.DataFrame(carbon_data_by_region[region_id])
+        if not carbon_df.empty:
+            carbon_df["from"] = pd.to_datetime(carbon_df["from"])
+            carbon_df["to"] = pd.to_datetime(carbon_df["to"])
+
+        merged_df = pd.merge_asof(
+            tariff_df.sort_values("valid_from"),
+            carbon_df.sort_values("from"),
+            left_on="valid_from",
+            right_on="from",
+            direction="backward"
+        )
+
+        merged_df["green_score"] = merged_df.apply(
+            lambda row: row["forecast"] / row["value_inc_vat"] if row["value_inc_vat"] > 0 else 0, axis=1
+        )
+
+        min_score = merged_df["green_score"].min()
+        max_score = merged_df["green_score"].max()
+        merged_df["normalized_green_score"] = merged_df["green_score"].apply(
+            lambda x: ((x - min_score) / (max_score - min_score) * 100) if max_score > min_score else 0
+        )
+
+        combined_results.append(merged_df)
+
+    if combined_results:
+        combined_df = pd.concat(combined_results, ignore_index=True)
+        for col in ["valid_from", "valid_to", "from", "to"]:
+            combined_df[col] = combined_df[col].dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        return combined_df
+    else:
+        return pd.DataFrame()
+
+# Lambda handler
+def lambda_handler(event, context):
+    product_code = "AGILE-24-10-01"
+    region_codes = list(REGION_MAPPING.keys())
+
+    start_time = datetime.utcnow()
+    end_time = start_time + timedelta(hours=24)
+    period_from = start_time.replace(microsecond=0).isoformat() + "Z"
+    period_to = end_time.replace(microsecond=0).isoformat() + "Z"
+
+    timestamp = start_time.strftime("%Y-%m-%dT%H-%M-%SZ")
+
+    all_tariff_rates = []
+    for region in region_codes:
+        rates = fetch_tariff_rates(product_code, region, period_from, period_to)
+        if rates:
+            all_tariff_rates.extend(rates)
+
+    carbon_data_by_region = fetch_carbon_intensity_24h(period_from)
+
+    combined_df = calculate_and_combine_data(all_tariff_rates, carbon_data_by_region)
+
+    combined_data_json = combined_df.to_dict(orient="records")
+    save_to_s3(S3_BUCKET_NAME, COMBINED_FILE_NAME, combined_data_json, timestamp)
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps("Data fetched, combined, and saved to S3 successfully!")
+    }
+
